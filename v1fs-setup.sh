@@ -1,27 +1,36 @@
-root@lab-kube-master:/home/skynet# cat demo.sh 
 #!/usr/bin/env bash
-# demo-suite.sh — Categorized menu to manage Trend Micro demos on your K8s lab
+# demo-suite.sh - Categorized menu to manage Trend Micro demos on your K8s lab
 #
-# Categories & items:
-# STATUS
-#  10) Check status (installed + pods by node)
-#  11) Status board (easy-to-read table)
-#  12) Show URLs (remote access for services)
+# MAIN
+#  1) Status
+#  2) Platform Tools
+#  q) Quit
 #
-# PLATFORM TOOLS (Container/File Security)
-#  20) Install/Upgrade Container Security (with TTL enforcer)
-#  21) Remove Container Security
-#  22) Install/Upgrade File Security (expose via NodePort + TTL enforcer)
-#  23) Remove File Security
+# PLATFORM TOOLS
+#  1) Check status (installed + pods by node)
+#  2) Container Security
+#  3) File Security
+#  4) Show URLs
+#  b) Back
 #
-# DEMOS (Post-deployment)
-#  30) Deploy Malicious Lab (DVWA+Malware; hostPorts on node2)
-#  31) Deploy Normal Lab (OpenWebUI+Ollama; NodePorts)
-#  32) Remove Malicious & Normal Labs
+# CONTAINER SECURITY
+#  1) Install/Upgrade Container Security (with TTL enforcer)
+#  2) Remove Container Security
+#  3) Deploy Demos (DVWA + Malware, OpenWebUI + Ollama)
+#  4) Remove Demos
+#  b) Back
+#
+# FILE SECURITY
+#  1) Install/Upgrade File Security (expose via NodePort + TTL enforcer)
+#  2) Remove File Security
+#  3) Start ICAP port-forward (0.0.0.0:1344 -> svc/*-scanner:1344)
+#  4) Stop  ICAP port-forward
+#  5) Status ICAP port-forward
+#  b) Back
 #
 # Notes:
 # - TTL enforcer prevents leftover trendmicro-scan-job-* by patching ttlSecondsAfterFinished.
-# - File Security scanner is exposed via NodePort so remote clients can connect.
+# - File Security scanner is exposed via NodePort and also supports a port-forward listener for ICAP on 0.0.0.0:1344.
 
 set -euo pipefail
 
@@ -46,13 +55,29 @@ TTL_ENF_CRB="scanjob-ttl-enforcer"
 TTL_ENF_CJ="scanjob-ttl-enforcer"
 TTL_SECONDS="${TTL_SECONDS:-600}"         # default 10 minutes
 
+# -------- ICAP Port-Forward (network-accessible) --------
+PF_ADDR="${PF_ADDR:-0.0.0.0}"            # listen on all interfaces
+PF_LOCAL_ICP="${PF_LOCAL_ICP:-1344}"     # local/listening port on this host
+PF_REMOTE_ICP="${PF_REMOTE_ICP:-1344}"   # remote service port (ICAP)
+PF_PIDFILE="${PF_PIDFILE:-/var/run/v1fs_icap_pf.pid}"
+PF_LOG="${PF_LOG:-/var/log/v1fs_icap_pf.log}"
+
 # -------- Styling (ASCII-safe) --------
 BOLD=$'\e[1m'; RESET=$'\e[0m'
 WARN="⚠️ "; ERR="❌"; OK="✅"; INFO="ℹ️ "
-is_utf8(){ locale charmap 2>/dev/null | grep -qi 'utf-8'; }
+is_utf8(){
+  # Force ASCII borders if FORCE_ASCII=1
+  [ "${FORCE_ASCII:-0}" = "1" ] && return 1
+  locale charmap 2>/dev/null | grep -qi 'utf-8'
+}
 hr(){
-  local cols="$(tput cols 2>/dev/null || echo 80)"
-  if is_utf8; then printf "%*s\n" "$cols" | tr ' ' '─'; else printf "%*s\n" "$cols" | tr ' ' '-'; fi
+  local cols
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  if is_utf8; then
+    printf "%*s\n" "$cols" | tr ' ' '─'
+  else
+    printf "%*s\n" "$cols" | tr ' ' '-'
+  fi
 }
 box(){
   local t="$1"
@@ -148,6 +173,7 @@ subjects:
   namespace: ${NS_CS}
 EOF
 
+  # IMPORTANT: escape \$ns, \$name and \$'\t' to avoid expansion at generation time.
   kubectl -n "$NS_CS" apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
@@ -172,8 +198,8 @@ spec:
                 set -eu
                 kubectl get jobs -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' \
                 | awk -F'\t' '\$2 ~ /^trendmicro-scan-job-/' \
-                | while IFS=$'\t' read ns name; do
-                    kubectl -n "$ns" patch job "$name" --type=merge -p '{"spec":{"ttlSecondsAfterFinished":'"${TTL_SECONDS}"'}}' >/dev/null 2>&1 || true
+                | while IFS=\$'\t' read ns name; do
+                    kubectl -n "\$ns" patch job "\$name" --type=merge -p '{"spec":{"ttlSecondsAfterFinished":'"${TTL_SECONDS}"'}}' >/dev/null 2>&1 || true
                   done
 EOF
 
@@ -204,7 +230,7 @@ status_check(){
   master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
   print_nodes_table "$master" "$node1" "$node2"
 
-  box "What’s Installed"
+  box "What is Installed"
   [ -n "$(installed_cs)" ] && echo "Container Security: installed (release: ${REL_CS}, ns: ${NS_CS})" \
                             || echo "Container Security: not installed"
   local fsrel; fsrel="$(installed_fs)"
@@ -231,12 +257,17 @@ status_board(){
   echo "File Security (${FS_NS}):";     kubectl -n "$FS_NS" get deploy,svc,po -o wide || true; echo
   echo "Default (demos):";              kubectl -n default get deploy,svc,po -o wide || true
 }
+
+# Safe under set -e: no && short-circuits; always returns 0
 status_urls(){
-  local master node1 node2; master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
+  set +e
+
+  local master node1 node2
+  master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
   local node2ip; node2ip="$(node_ip "$node2")"
   local ips; ips="$(node_ips_all)"
 
-  box "Remote & Internal Access URLs"
+  box "Remote and Internal Access URLs"
 
   echo "Malicious Lab (hostPorts on node2)"
   if [ -n "$node2ip" ]; then
@@ -249,21 +280,29 @@ status_urls(){
 
   echo "Normal Lab (NodePorts on any node)"
   for ip in $ips; do
-    kubectl -n default get svc openwebui >/dev/null 2>&1 && \
+    if kubectl -n default get svc openwebui >/dev/null 2>&1; then
       echo "  OpenWebUI              ->  http://${ip}:${OPENWEBUI_NODEPORT}"
-    kubectl -n default get svc ollama >/dev/null 2>&1 && \
+    fi
+    if kubectl -n default get svc ollama >/dev/null 2>&1; then
       echo "  Ollama API             ->  http://${ip}:${OLLAMA_NODEPORT}/api/version"
+    fi
   done
   echo
 
   echo "Vision One File Security gRPC (NodePort)"
-  for ip in $ips; do
-    kubectl -n "$FS_NS" get svc "$FS_NODEPORT_SVC" >/dev/null 2>&1 && \
+  if kubectl -n "$FS_NS" get svc "$FS_NODEPORT_SVC" >/dev/null 2>&1; then
+    for ip in $ips; do
       echo "  Scanner                ->  ${ip}:${FS_NODEPORT}"
-  done
+    done
+  else
+    echo "  ${WARN}Service ${FS_NODEPORT_SVC} not found in ${FS_NS}."
+  fi
+
+  set -e
+  return 0
 }
 
-# ===================== PLATFORM TOOLS =====================
+# ===================== PLATFORM TOOLS: Container Security =====================
 remove_cs(){
   echo "${INFO} Cleaning scan jobs first..."
   cleanup_scan_jobs_now
@@ -277,7 +316,7 @@ remove_cs(){
 }
 install_cs(){
   need kubectl; need helm
-  echo "== Install/Upgrade Trend Micro Vision One Container Security =="
+  echo "== Install or Upgrade Trend Micro Vision One Container Security =="
   read -r -p "Paste NEW Vision One bootstrap token: " BOOTSTRAP_TOKEN
   [ -z "${BOOTSTRAP_TOKEN}" ] && { echo "Token cannot be empty"; exit 1; }
   echo "Choose tenant region:
@@ -315,7 +354,7 @@ EOF
   if helm status "$REL_CS" -n "$NS_CS" >/dev/null 2>&1; then
     echo "Release exists -> upgrading..."
     helm get values --namespace "$NS_CS" "$REL_CS" | helm upgrade \
-      "$REL_CS" --namespace "$NS_CS" --values "$OVERRIDES" "$CS_CHART_URL"
+      "$REL_CS" --namespace "$NS_CS" --values "$OVERRIDES" "$CS_CHART_URL" || true
   else
     echo "Installing new release..."
     helm install "$REL_CS" --namespace "$NS_CS" --create-namespace \
@@ -330,6 +369,8 @@ EOF
   install_ttl_enforcer
   echo "${OK} Container Security ready."
 }
+
+# ===================== PLATFORM TOOLS: File Security =====================
 remove_fs(){
   echo "${INFO} Cleaning scan jobs first..."
   cleanup_scan_jobs_now
@@ -342,7 +383,7 @@ remove_fs(){
 }
 install_fs(){
   need kubectl; need helm
-  echo "== Install/Upgrade Trend Vision One — File Security =="
+  echo "== Install or Upgrade Trend Vision One File Security =="
   read -r -p "Paste File Security REGISTRATION TOKEN: " FS_TOKEN
   [ -z "$FS_TOKEN" ] && { echo "Token cannot be empty"; exit 1; }
 
@@ -386,6 +427,91 @@ YAML
   install_ttl_enforcer
 
   echo "${OK} File Security exposed at NodePort ${FS_NODEPORT_SVC}:${FS_NODEPORT}"
+}
+
+# ===================== ICAP Port-Forward Helpers =====================
+icap_release_name(){
+  local rel; rel="$(installed_fs)"
+  if [ -z "$rel" ]; then rel="$FS_REL_DEFAULT"; fi
+  echo "$rel"
+}
+icap_svc_name(){
+  echo "$(icap_release_name)-visionone-filesecurity-scanner"
+}
+icap_pf_is_running(){
+  [ -f "$PF_PIDFILE" ] || return 1
+  local pid; pid="$(cat "$PF_PIDFILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+icap_pf_status(){
+  if icap_pf_is_running; then
+    echo "${OK} ICAP port-forward is running (pid $(cat "$PF_PIDFILE"))."
+  else
+    echo "${WARN} ICAP port-forward is NOT running."
+  fi
+  if command -v ss >/dev/null; then
+    ss -ltn | awk -v p=":${PF_LOCAL_ICP}" '$4 ~ p'
+  else
+    netstat -ltn 2>/dev/null | awk -v p=":${PF_LOCAL_ICP}" '$4 ~ p'
+  fi
+  echo "Reachable URLs on this host:"
+  for ip in $(hostname -I 2>/dev/null); do
+    echo "  icap://$ip:${PF_LOCAL_ICP}"
+  done
+}
+icap_pf_start(){
+  need kubectl
+  ensure_ns "$FS_NS"
+  local svc; svc="$(icap_svc_name)"
+
+  if ! kubectl -n "$FS_NS" get svc "$svc" >/dev/null 2>&1; then
+    echo "${ERR} Service $svc not found in namespace $FS_NS."
+    echo "      Make sure File Security is installed and the scanner Service exists."
+    return 1
+  fi
+  if icap_pf_is_running; then
+    echo "${INFO} Port-forward already running (pid $(cat "$PF_PIDFILE"))."
+    icap_pf_status
+    return 0
+  fi
+
+  echo "${INFO} Starting ICAP port-forward on ${PF_ADDR}:${PF_LOCAL_ICP} -> ${svc}:${PF_REMOTE_ICP}"
+  mkdir -p "$(dirname "$PF_LOG")" "$(dirname "$PF_PIDFILE")"
+
+  nohup kubectl -n "$FS_NS" port-forward \
+      "svc/${svc}" \
+      "${PF_LOCAL_ICP}:${PF_REMOTE_ICP}" \
+      --address "${PF_ADDR}" \
+      --pod-running-timeout=2m \
+      >> "$PF_LOG" 2>&1 &
+
+  echo $! > "$PF_PIDFILE"
+  sleep 1
+
+  if icap_pf_is_running; then
+    echo "${OK} Port-forward started. Log: $PF_LOG"
+    icap_pf_status
+  else
+    echo "${ERR} Failed to start port-forward. Check $PF_LOG"
+    rm -f "$PF_PIDFILE"
+    return 1
+  fi
+}
+icap_pf_stop(){
+  if ! icap_pf_is_running; then
+    echo "${INFO} No active ICAP port-forward."
+    return 0
+  fi
+  local pid; pid="$(cat "$PF_PIDFILE")"
+  echo "${INFO} Stopping port-forward (pid $pid)..."
+  kill "$pid" 2>/dev/null || true
+  sleep 1
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "${WARN} Force killing $pid"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PF_PIDFILE"
+  echo "${OK} Stopped."
 }
 
 # ===================== DEMOS =====================
@@ -572,46 +698,51 @@ remove_labs(){
 # ===================== MENUS =====================
 main_menu(){
   clear
-  box "Trend Micro Demo — Main Menu"
+  box "Trend Micro Demo - Main Menu"
   cat <<MENU
-  [1] STATUS
-  [2] PLATFORM TOOLS (Container/File Security)
-  [3] DEMOS (Post-deployment)
-  [q] Quit
-MENU
-  echo -n "Choose category: "
-}
-status_menu(){
-  clear
-  box "STATUS"
-  cat <<MENU
-  10) Check status (installed + pods by node)
-  11) Status board
-  12) Show URLs
-  b)  Back
+  1) Status
+  2) Platform Tools
+  q) Quit
 MENU
   echo -n "Choose: "
 }
-tools_menu(){
+
+platform_tools_menu(){
   clear
-  box "PLATFORM TOOLS (Container/File Security)"
+  box "PLATFORM TOOLS"
   cat <<MENU
-  20) Install/Upgrade Container Security (with TTL enforcer)
-  21) Remove Container Security
-  22) Install/Upgrade File Security (expose via NodePort ${FS_NODEPORT} + TTL enforcer)
-  23) Remove File Security
-  b)  Back
+  1) Check status (installed + pods by node)
+  2) Container Security
+  3) File Security
+  4) Show URLs
+  b) Back
 MENU
   echo -n "Choose: "
 }
-demos_menu(){
+
+container_security_menu(){
   clear
-  box "DEMOS (Post-deployment)"
+  box "Container Security"
   cat <<MENU
-  30) Deploy Malicious Lab (DVWA+Malware)
-  31) Deploy Normal Lab (OpenWebUI+Ollama)
-  32) Remove Malicious & Normal Labs
-  b)  Back
+  1) Install/Upgrade Container Security (with TTL enforcer)
+  2) Remove Container Security
+  3) Deploy Demos (DVWA + Malware, OpenWebUI + Ollama)
+  4) Remove Demos
+  b) Back
+MENU
+  echo -n "Choose: "
+}
+
+file_security_menu(){
+  clear
+  box "File Security"
+  cat <<MENU
+  1) Install/Upgrade File Security (expose via NodePort + TTL enforcer)
+  2) Remove File Security
+  3) Start ICAP port-forward (0.0.0.0:${PF_LOCAL_ICP} -> svc/*-scanner:${PF_REMOTE_ICP})
+  4) Stop  ICAP port-forward
+  5) Status ICAP port-forward
+  b) Back
 MENU
   echo -n "Choose: "
 }
@@ -622,48 +753,58 @@ while true; do
   main_menu
   read -r CAT
   case "${CAT:-}" in
-    1)
-      while true; do
-        status_menu
-        read -r CH
-        case "${CH:-}" in
-          10) status_check;  read -rp $'\n[enter] ' _ ;;
-          11) status_board;  read -rp $'\n[enter] ' _ ;;
-          12) status_urls;   read -rp $'\n[enter] ' _ ;;
-          b|B) break ;;
-          *) echo "${WARN} Invalid option" ;;
-        esac
-      done
-      ;;
-    2)
-      while true; do
-        tools_menu
-        read -r CH
-        case "${CH:-}" in
-          20) install_cs; read -rp $'\n[enter] ' _ ;;
-          21) remove_cs;  read -rp $'\n[enter] ' _ ;;
-          22) install_fs; read -rp $'\n[enter] ' _ ;;
-          23) remove_fs;  read -rp $'\n[enter] ' _ ;;
-          b|B) break ;;
-          *) echo "${WARN} Invalid option" ;;
-        esac
-      done
-      ;;
-    3)
-      while true; do
-        demos_menu
-        read -r CH
-        case "${CH:-}" in
-          30) deploy_malicious; read -rp $'\n[enter] ' _ ;;
-          31) deploy_normal;    read -rp $'\n[enter] ' _ ;;
-          32) remove_labs;      read -rp $'\n[enter] ' _ ;;
-          b|B) break ;;
-          *) echo "${WARN} Invalid option" ;;
-        esac
-      done
-      ;;
+    1)  # Status (direct)
+        status_check
+        read -rp $'\n[enter] ' _
+        ;;
+    2)  # Platform Tools
+        while true; do
+          platform_tools_menu
+          read -r PT
+          case "${PT:-}" in
+            1)  # Check status
+                status_check
+                read -rp $'\n[enter] ' _
+                ;;
+            2)  # Container Security submenu
+                while true; do
+                  container_security_menu
+                  read -r CSCH
+                  case "${CSCH:-}" in
+                    1) install_cs;    read -rp $'\n[enter] ' _ ;;
+                    2) remove_cs;     read -rp $'\n[enter] ' _ ;;
+                    3) deploy_malicious; deploy_normal; read -rp $'\n[enter] ' _ ;;
+                    4) remove_labs;   read -rp $'\n[enter] ' _ ;;
+                    b|B) break ;;
+                    *) echo "${WARN} Invalid option" ;;
+                  esac
+                done
+                ;;
+            3)  # File Security submenu
+                while true; do
+                  file_security_menu
+                  read -r FSCH
+                  case "${FSCH:-}" in
+                    1) install_fs;      read -rp $'\n[enter] ' _ ;;
+                    2) remove_fs;       read -rp $'\n[enter] ' _ ;;
+                    3) icap_pf_start;   read -rp $'\n[enter] ' _ ;;
+                    4) icap_pf_stop;    read -rp $'\n[enter] ' _ ;;
+                    5) icap_pf_status;  read -rp $'\n[enter] ' _ ;;
+                    b|B) break ;;
+                    *) echo "${WARN} Invalid option" ;;
+                  esac
+                done
+                ;;
+            4)  # Show URLs
+                status_urls
+                read -rp $'\n[enter] ' _
+                ;;
+            b|B) break ;;
+            *) echo "${WARN} Invalid option" ;;
+          esac
+        done
+        ;;
     q|Q) exit 0 ;;
-    *) echo "${WARN} Invalid category" ;;
+    *)   echo "${WARN} Invalid option" ;;
   esac
 done
-root@lab-kube-master:/home/skynet# 
