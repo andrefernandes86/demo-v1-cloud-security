@@ -77,7 +77,7 @@ PLATFORM TOOLS
 ```
 
 - **Install/Upgrade**: you’ll be prompted for the **bootstrap token** and region.
-- **Deploy Demos**: installs DVWA, Malware Samples (hostPorts on a worker), OpenWebUI+Ollama (NodePorts).
+- **Deploy Demos**: installs DVWA, Malware Samples (hostPorts on a worker), OpenWebUI+Ollama (NodePorts). Note: This step can take some time (up to 5 minutes).
 
 #### File Security → (sub-menu)
 ```
