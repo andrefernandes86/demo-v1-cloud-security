@@ -11,6 +11,7 @@
 #  2) Container Security
 #  3) File Security
 #  4) Show URLs
+#  5) Validate & Clean Up previous components   <-- NEW
 #  b) Back
 #
 # CONTAINER SECURITY
@@ -65,27 +66,13 @@ PF_LOG="${PF_LOG:-/var/log/v1fs_icap_pf.log}"
 # -------- Styling (ASCII-safe) --------
 BOLD=$'\e[1m'; RESET=$'\e[0m'
 WARN="⚠️ "; ERR="❌"; OK="✅"; INFO="ℹ️ "
-is_utf8(){
-  # Force ASCII borders if FORCE_ASCII=1
-  [ "${FORCE_ASCII:-0}" = "1" ] && return 1
-  locale charmap 2>/dev/null | grep -qi 'utf-8'
-}
-hr(){
-  local cols
-  cols="$(tput cols 2>/dev/null || echo 80)"
-  if is_utf8; then
-    printf "%*s\n" "$cols" | tr ' ' '─'
-  else
-    printf "%*s\n" "$cols" | tr ' ' '-'
-  fi
-}
-box(){
-  local t="$1"
-  hr
-  if is_utf8; then printf "\e[1m%s\e[0m\n" "$t"; else printf "%s\n" "$t"; fi
-  hr
-}
+is_utf8(){ [ "${FORCE_ASCII:-0}" = "1" ] && return 1; locale charmap 2>/dev/null | grep -qi 'utf-8'; }
+hr(){ local cols; cols="$(tput cols 2>/dev/null || echo 80)"; if is_utf8; then printf "%*s\n" "$cols" | tr ' ' '─'; else printf "%*s\n" "$cols" | tr ' ' '-'; fi; }
+box(){ local t="$1"; hr; if is_utf8; then printf "\e[1m%s\e[0m\n" "$t"; else printf "%s\n" "$t"; fi; hr; }
 need(){ command -v "$1" >/dev/null || { echo "${ERR} Missing: $1"; exit 1; } }
+kdel(){ # best-effort delete
+  kubectl "$@" 2>/dev/null || true
+}
 
 # -------- Node discovery --------
 node_ip(){ local n="${1:-}"; [ -z "$n" ] && return 0; kubectl get node "$n" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true; }
@@ -173,7 +160,6 @@ subjects:
   namespace: ${NS_CS}
 EOF
 
-  # IMPORTANT: escape \$ns, \$name and \$'\t' to avoid expansion at generation time.
   kubectl -n "$NS_CS" apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
@@ -207,10 +193,10 @@ EOF
 }
 remove_ttl_enforcer(){
   echo "${INFO} Removing TTL enforcer..."
-  kubectl -n "$NS_CS" delete cronjob "${TTL_ENF_CJ}" --ignore-not-found
-  kubectl delete clusterrolebinding "${TTL_ENF_CRB}" --ignore-not-found
-  kubectl delete clusterrole "${TTL_ENF_CR}" --ignore-not-found
-  kubectl -n "$NS_CS" delete serviceaccount "${TTL_ENF_SA}" --ignore-not-found
+  kdel -n "$NS_CS" delete cronjob "${TTL_ENF_CJ}" --ignore-not-found
+  kdel delete clusterrolebinding "${TTL_ENF_CRB}" --ignore-not-found
+  kdel delete clusterrole "${TTL_ENF_CR}" --ignore-not-found
+  kdel -n "$NS_CS" delete serviceaccount "${TTL_ENF_SA}" --ignore-not-found
   echo "${OK} TTL enforcer removed."
 }
 cleanup_scan_jobs_now(){
@@ -261,9 +247,7 @@ status_board(){
 # Safe under set -e: no && short-circuits; always returns 0
 status_urls(){
   set +e
-
-  local master node1 node2
-  master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
+  local master node1 node2; master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
   local node2ip; node2ip="$(node_ip "$node2")"
   local ips; ips="$(node_ips_all)"
 
@@ -291,27 +275,21 @@ status_urls(){
 
   echo "Vision One File Security gRPC (NodePort)"
   if kubectl -n "$FS_NS" get svc "$FS_NODEPORT_SVC" >/dev/null 2>&1; then
-    for ip in $ips; do
-      echo "  Scanner                ->  ${ip}:${FS_NODEPORT}"
-    done
+    for ip in $ips; do echo "  Scanner                ->  ${ip}:${FS_NODEPORT}"; done
   else
     echo "  ${WARN}Service ${FS_NODEPORT_SVC} not found in ${FS_NS}."
   fi
 
-  set -e
-  return 0
+  set -e; return 0
 }
 
 # ===================== PLATFORM TOOLS: Container Security =====================
 remove_cs(){
-  echo "${INFO} Cleaning scan jobs first..."
-  cleanup_scan_jobs_now
-  echo "${INFO} Removing TTL enforcer..."
-  remove_ttl_enforcer
-
+  echo "${INFO} Cleaning scan jobs first..."; cleanup_scan_jobs_now
+  echo "${INFO} Removing TTL enforcer...";   remove_ttl_enforcer
   echo "${INFO} Uninstalling Container Security..."
-  helm uninstall "$REL_CS" -n "$NS_CS" || true
-  kubectl delete ns "$NS_CS" --wait=false || true
+  kdel uninstall "$REL_CS" -n "$NS_CS"
+  kdel delete ns "$NS_CS" --wait=false
   echo "${OK} Container Security removed."
 }
 install_cs(){
@@ -362,8 +340,21 @@ EOF
   fi
 
   echo "Waiting for core components..."
-  for d in trendmicro-oversight-controller trendmicro-scan-manager trendmicro-policy-operator trendmicro-metacollector trendmicro-admission-controller trendmicro-usage-controller trendmicro-scout; do
-    kubectl -n "$NS_CS" rollout status deploy "$d" --timeout=180s || true
+  components=(
+    trendmicro-oversight-controller
+    trendmicro-scan-manager
+    trendmicro-policy-operator
+    trendmicro-metacollector
+    trendmicro-admission-controller
+    trendmicro-usage-controller
+    trendmicro-scout      # optional in some chart versions
+  )
+  for d in "${components[@]}"; do
+    if kubectl -n "$NS_CS" get deploy "$d" >/dev/null 2>&1; then
+      kubectl -n "$NS_CS" rollout status deploy "$d" --timeout=180s || true
+    else
+      echo "${INFO} Skipping rollout wait for missing deployment: $d"
+    fi
   done
 
   install_ttl_enforcer
@@ -372,13 +363,11 @@ EOF
 
 # ===================== PLATFORM TOOLS: File Security =====================
 remove_fs(){
-  echo "${INFO} Cleaning scan jobs first..."
-  cleanup_scan_jobs_now
-
+  echo "${INFO} Cleaning scan jobs first..."; cleanup_scan_jobs_now
   local rel; rel="$(installed_fs)"; if [ -z "$rel" ]; then rel="$FS_REL_DEFAULT"; fi
   echo "${INFO} Uninstalling File Security (${rel})..."
-  helm uninstall "$rel" -n "$FS_NS" || true
-  kubectl delete ns "$FS_NS" --wait=false || true
+  kdel uninstall "$rel" -n "$FS_NS"
+  kdel delete ns "$FS_NS" --wait=false
   echo "${OK} File Security removed."
 }
 install_fs(){
@@ -423,102 +412,55 @@ spec:
       nodePort: ${FS_NODEPORT}
 YAML
 
-  # Ensure TTL enforcer exists (even if CS not installed)
   install_ttl_enforcer
-
   echo "${OK} File Security exposed at NodePort ${FS_NODEPORT_SVC}:${FS_NODEPORT}"
 }
 
+# ===================== OpenWebUI Secret helper =====================
+ensure_openwebui_secret(){
+  ensure_ns default
+  local key="${WEBUI_SECRET_KEY:-}"
+  if [ -z "$key" ]; then
+    key="$(head -c32 /dev/urandom | base64 | tr -d '=+/ \n' | cut -c1-64)"
+  fi
+  kubectl -n default create secret generic openwebui-secret \
+    --from-literal=WEBUI_SECRET_KEY="$key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+}
+
 # ===================== ICAP Port-Forward Helpers =====================
-icap_release_name(){
-  local rel; rel="$(installed_fs)"
-  if [ -z "$rel" ]; then rel="$FS_REL_DEFAULT"; fi
-  echo "$rel"
-}
-icap_svc_name(){
-  echo "$(icap_release_name)-visionone-filesecurity-scanner"
-}
-icap_pf_is_running(){
-  [ -f "$PF_PIDFILE" ] || return 1
-  local pid; pid="$(cat "$PF_PIDFILE" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
+icap_release_name(){ local rel; rel="$(installed_fs)"; [ -z "$rel" ] && rel="$FS_REL_DEFAULT"; echo "$rel"; }
+icap_svc_name(){ echo "$(icap_release_name)-visionone-filesecurity-scanner"; }
+icap_pf_is_running(){ [ -f "$PF_PIDFILE" ] || return 1; local pid; pid="$(cat "$PF_PIDFILE" 2>/dev/null || true)"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
 icap_pf_status(){
-  if icap_pf_is_running; then
-    echo "${OK} ICAP port-forward is running (pid $(cat "$PF_PIDFILE"))."
-  else
-    echo "${WARN} ICAP port-forward is NOT running."
-  fi
-  if command -v ss >/dev/null; then
-    ss -ltn | awk -v p=":${PF_LOCAL_ICP}" '$4 ~ p'
-  else
-    netstat -ltn 2>/dev/null | awk -v p=":${PF_LOCAL_ICP}" '$4 ~ p'
-  fi
-  echo "Reachable URLs on this host:"
-  for ip in $(hostname -I 2>/dev/null); do
-    echo "  icap://$ip:${PF_LOCAL_ICP}"
-  done
+  if icap_pf_is_running; then echo "${OK} ICAP port-forward is running (pid $(cat "$PF_PIDFILE"))."; else echo "${WARN} ICAP port-forward is NOT running."; fi
+  if command -v ss >/dev/null; then ss -ltn | awk -v p=":${PF_LOCAL_ICP}" '$4 ~ p'; else netstat -ltn 2>/dev/null | awk -v p=":${PF_LOCAL_ICP}" '$4 ~ p'; fi
+  echo "Reachable URLs on this host:"; for ip in $(hostname -I 2>/dev/null); do echo "  icap://$ip:${PF_LOCAL_ICP}"; done
 }
 icap_pf_start(){
-  need kubectl
-  ensure_ns "$FS_NS"
+  need kubectl; ensure_ns "$FS_NS"
   local svc; svc="$(icap_svc_name)"
-
   if ! kubectl -n "$FS_NS" get svc "$svc" >/dev/null 2>&1; then
-    echo "${ERR} Service $svc not found in namespace $FS_NS."
-    echo "      Make sure File Security is installed and the scanner Service exists."
-    return 1
-  fi
-  if icap_pf_is_running; then
-    echo "${INFO} Port-forward already running (pid $(cat "$PF_PIDFILE"))."
-    icap_pf_status
-    return 0
-  fi
-
+    echo "${ERR} Service $svc not found in namespace $FS_NS."; echo "      Make sure File Security is installed and the scanner Service exists."; return 1; fi
+  if icap_pf_is_running; then echo "${INFO} Port-forward already running (pid $(cat "$PF_PIDFILE"))."; icap_pf_status; return 0; fi
   echo "${INFO} Starting ICAP port-forward on ${PF_ADDR}:${PF_LOCAL_ICP} -> ${svc}:${PF_REMOTE_ICP}"
   mkdir -p "$(dirname "$PF_LOG")" "$(dirname "$PF_PIDFILE")"
-
-  nohup kubectl -n "$FS_NS" port-forward \
-      "svc/${svc}" \
-      "${PF_LOCAL_ICP}:${PF_REMOTE_ICP}" \
-      --address "${PF_ADDR}" \
-      --pod-running-timeout=2m \
-      >> "$PF_LOG" 2>&1 &
-
-  echo $! > "$PF_PIDFILE"
-  sleep 1
-
-  if icap_pf_is_running; then
-    echo "${OK} Port-forward started. Log: $PF_LOG"
-    icap_pf_status
-  else
-    echo "${ERR} Failed to start port-forward. Check $PF_LOG"
-    rm -f "$PF_PIDFILE"
-    return 1
-  fi
+  nohup kubectl -n "$FS_NS" port-forward "svc/${svc}" "${PF_LOCAL_ICP}:${PF_REMOTE_ICP}" --address "${PF_ADDR}" --pod-running-timeout=2m >> "$PF_LOG" 2>&1 &
+  echo $! > "$PF_PIDFILE"; sleep 1
+  if icap_pf_is_running; then echo "${OK} Port-forward started. Log: $PF_LOG"; icap_pf_status; else echo "${ERR} Failed to start port-forward. Check $PF_LOG"; rm -f "$PF_PIDFILE"; return 1; fi
 }
 icap_pf_stop(){
-  if ! icap_pf_is_running; then
-    echo "${INFO} No active ICAP port-forward."
-    return 0
-  fi
-  local pid; pid="$(cat "$PF_PIDFILE")"
-  echo "${INFO} Stopping port-forward (pid $pid)..."
-  kill "$pid" 2>/dev/null || true
-  sleep 1
-  if kill -0 "$pid" 2>/dev/null; then
-    echo "${WARN} Force killing $pid"
-    kill -9 "$pid" 2>/dev/null || true
-  fi
-  rm -f "$PF_PIDFILE"
-  echo "${OK} Stopped."
+  if ! icap_pf_is_running; then echo "${INFO} No active ICAP port-forward."; return 0; fi
+  local pid; pid="$(cat "$PF_PIDFILE")"; echo "${INFO} Stopping port-forward (pid $pid)..."
+  kill "$pid" 2>/dev/null || true; sleep 1
+  if kill -0 "$pid" 2>/dev/null; then echo "${WARN} Force killing $pid"; kill -9 "$pid" 2>/dev/null || true; fi
+  rm -f "$PF_PIDFILE"; echo "${OK} Stopped."
 }
 
 # ===================== DEMOS =====================
 deploy_malicious(){
   local master node1 node2; master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
   [ -z "$node2" ] && { echo "${ERR} Could not find node2 to pin hostPorts."; exit 1; }
-
   cat <<YAML | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -578,12 +520,12 @@ spec:
   ports: [{ name: http, port: 80, targetPort: 80 }]
   type: ClusterIP
 YAML
-
   kubectl -n default rollout status deploy/dvwa-vulnerablewebapp --timeout=180s || true
   kubectl -n default rollout status deploy/malware-samples       --timeout=180s || true
   echo "${OK} Malicious lab deployed."
 }
 deploy_normal(){
+  ensure_openwebui_secret
   cat <<'YAML' | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -604,15 +546,22 @@ spec:
         fsGroup: 1000
         seccompProfile: { type: RuntimeDefault }
       initContainers:
-      - name: fix-perms
+      - name: verify-data-dir
         image: busybox:1.36
-        command: ["sh","-c","chmod -R 0777 /data || true"]
-        volumeMounts: [{ name: owui-data, mountPath: /data }]
+        command: ["sh","-c","set -e; mkdir -p /app/backend/data && ls -ld /app/backend/data || true"]
+        volumeMounts:
+          - { name: owui-data, mountPath: /app/backend/data }
       containers:
       - name: openwebui
-        image: ghcr.io/open-webui/open-webui:latest
+        image: ghcr.io/open-webui/open-webui:main
         imagePullPolicy: IfNotPresent
-        env: [{ name: OLLAMA_API_BASE_URL, value: http://ollama:11434 }]
+        env:
+          - { name: OLLAMA_BASE_URL, value: "http://ollama:11434" }
+          - name: WEBUI_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: openwebui-secret
+                key: WEBUI_SECRET_KEY
         ports: [{ name: http, containerPort: 8080 }]
         securityContext:
           runAsNonRoot: true
@@ -624,8 +573,11 @@ spec:
         resources:
           requests: { cpu: 200m, memory: 256Mi }
           limits:   { cpu: "1",  memory: 1Gi }
-        volumeMounts: [{ name: owui-data, mountPath: /app/backend/data }]
-      volumes: [{ name: owui-data, emptyDir: {} }]
+        volumeMounts:
+          - { name: owui-data, mountPath: /app/backend/data }
+      volumes:
+        - name: owui-data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -684,15 +636,136 @@ spec:
   ports: [{ name: api, port: 11434, targetPort: 11434, nodePort: 31134 }]
   type: NodePort
 YAML
-
-  kubectl -n default rollout status deploy/openwebui --timeout=180s || true
+  kubectl -n default rollout status deploy/openwebui --timeout=240s || true
   kubectl -n default rollout status deploy/ollama   --timeout=300s || true
   echo "${OK} Normal lab deployed."
 }
 remove_labs(){
-  kubectl -n default delete deploy dvwa-vulnerablewebapp malware-samples openwebui ollama --ignore-not-found
-  kubectl -n default delete svc    dvwa-vulnerablewebapp malware-samples openwebui ollama --ignore-not-found
+  kdel -n default delete deploy dvwa-vulnerablewebapp malware-samples openwebui ollama --ignore-not-found
+  kdel -n default delete svc    dvwa-vulnerablewebapp malware-samples openwebui ollama --ignore-not-found
   echo "${OK} Removed demo labs."
+}
+
+# ===================== CLEANUP WIZARD (new) =====================
+prompt_yn(){
+  local msg="$1" def="${2:-y}" ans
+  read -r -p "$msg [${def^^}/$( [ "$def" = "y" ] && echo n || echo y )]: " ans || true
+  ans="${ans:-$def}"
+  case "${ans,,}" in y|yes) return 0 ;; *) return 1 ;; esac
+}
+list_leftovers(){
+  # Echo a summary of suspected leftovers (no deletes here).
+  box "Cleanup — Detected Items"
+  echo "Namespaces:"
+  kubectl get ns "$NS_CS" "$FS_NS" 2>/dev/null | sed '1d' || true
+  echo
+
+  echo "Default namespace (demos/resources):"
+  kubectl -n default get deploy dvwa-vulnerablewebapp malware-samples openwebui ollama 2>/dev/null | sed '1d' || true
+  kubectl -n default get svc    dvwa-vulnerablewebapp malware-samples openwebui ollama 2>/dev/null | sed '1d' || true
+  kubectl -n default get secret openwebui-secret 2>/dev/null | sed '1d' || true
+  echo
+
+  echo "Trend Micro scan jobs (any namespace):"
+  kubectl get jobs -A 2>/dev/null | awk 'NR==1 || $2 ~ /^trendmicro-scan-job-/' || true
+  echo
+
+  echo "TTL enforcer components:"
+  kubectl -n "$NS_CS" get cronjob "$TTL_ENF_CJ" 2>/dev/null | sed '1d' || true
+  kubectl get clusterrole "$TTL_ENF_CR" 2>/dev/null | sed '1d' || true
+  kubectl get clusterrolebinding "$TTL_ENF_CRB" 2>/dev/null | sed '1d' || true
+  kubectl -n "$NS_CS" get sa "$TTL_ENF_SA" 2>/dev/null | sed '1d' || true
+  echo
+
+  echo "File Security NodePort:"
+  kubectl -n "$FS_NS" get svc "$FS_NODEPORT_SVC" 2>/dev/null | sed '1d' || true
+  echo
+
+  echo "ICAP port-forward:"
+  if [ -f "$PF_PIDFILE" ]; then
+    echo "  PID $(cat "$PF_PIDFILE" 2>/dev/null || echo '?') (pidfile: $PF_PIDFILE)"
+  else
+    echo "  (none)"
+  fi
+  echo
+
+  echo "Failed/CrashLoop pods (last hour):"
+  kubectl get pods -A --field-selector=status.phase!=Running 2>/dev/null | awk 'NR==1 || /CrashLoopBackOff|Error|ImagePullBackOff|Completed/' || true
+}
+cleanup_wizard(){
+  need kubectl
+  list_leftovers
+  echo
+  if prompt_yn "Do you want to run quick clean ALL (safe deletes of demos, scan-jobs TTL, TTL enforcer, secrets, NodePorts, port-forward, failed pods)?" y; then
+    cleanup_all_safe
+    echo "${OK} Quick clean complete."
+    return 0
+  fi
+
+  echo
+  box "Choose Items to Clean"
+  if prompt_yn "• Remove demo Deployments/Services in 'default' (DVWA, Malware, OpenWebUI, Ollama)?" y; then
+    remove_labs
+  fi
+
+  if prompt_yn "• Stop ICAP port-forward (if running)?" y; then
+    icap_pf_stop
+  fi
+
+  if prompt_yn "• Remove File Security NodePort Service (${FS_NODEPORT_SVC} in ${FS_NS})?" y; then
+    kdel -n "$FS_NS" delete svc "$FS_NODEPORT_SVC" --ignore-not-found
+  fi
+
+  if prompt_yn "• Remove OpenWebUI secret (openwebui-secret in default)?" y; then
+    kdel -n default delete secret openwebui-secret --ignore-not-found
+  fi
+
+  if prompt_yn "• Force TTL on trendmicro-scan-job-* to 1s (fast GC)?" y; then
+    cleanup_scan_jobs_now
+  fi
+
+  if prompt_yn "• Remove TTL enforcer (CronJob/SA/CR/CRB)?" y; then
+    remove_ttl_enforcer
+  fi
+
+  if prompt_yn "• Remove Trend Micro namespaces (${NS_CS}, ${FS_NS}) if empty?" n; then
+    kdel delete ns "$NS_CS" --ignore-not-found --wait=false
+    kdel delete ns "$FS_NS" --ignore-not-found --wait=false
+  fi
+
+  if prompt_yn "• Delete FAILED/CrashLoop pods (best effort)?" y; then
+    # Delete pods in bad states across all namespaces (won't touch Running)
+    set +e
+    mapfile -t badpods < <(kubectl get pods -A --no-headers 2>/dev/null | awk '/CrashLoopBackOff|Error|ImagePullBackOff/{print $1":"$2}')
+    for ns_pod in "${badpods[@]}"; do
+      ns="${ns_pod%%:*}"; pod="${ns_pod##*:}"
+      echo "Deleting ${ns}/${pod} ..."
+      kdel -n "$ns" delete pod "$pod" --force --grace-period=0
+    done
+    set -e
+  fi
+
+  echo "${OK} Cleanup wizard finished."
+}
+cleanup_all_safe(){
+  # Safe, opinionated cleanup
+  remove_labs
+  icap_pf_stop
+  kdel -n "$FS_NS" delete svc "$FS_NODEPORT_SVC" --ignore-not-found
+  kdel -n default delete secret openwebui-secret --ignore-not-found
+  cleanup_scan_jobs_now
+  remove_ttl_enforcer
+  kdel delete ns "$NS_CS" --ignore-not-found --wait=false
+  kdel delete ns "$FS_NS" --ignore-not-found --wait=false
+  # Delete clearly failed/crashing pods
+  set +e
+  mapfile -t badpods < <(kubectl get pods -A --no-headers 2>/dev/null | awk '/CrashLoopBackOff|Error|ImagePullBackOff/{print $1":"$2}')
+  for ns_pod in "${badpods[@]}"; do
+    ns="${ns_pod%%:*}"; pod="${ns_pod##*:}"
+    echo "Deleting ${ns}/${pod} ..."
+    kdel -n "$ns" delete pod "$pod" --force --grace-period=0
+  done
+  set -e
 }
 
 # ===================== MENUS =====================
@@ -706,7 +779,6 @@ main_menu(){
 MENU
   echo -n "Choose: "
 }
-
 platform_tools_menu(){
   clear
   box "PLATFORM TOOLS"
@@ -715,11 +787,11 @@ platform_tools_menu(){
   2) Container Security
   3) File Security
   4) Show URLs
+  5) Validate & Clean Up previous components
   b) Back
 MENU
   echo -n "Choose: "
 }
-
 container_security_menu(){
   clear
   box "Container Security"
@@ -732,7 +804,6 @@ container_security_menu(){
 MENU
   echo -n "Choose: "
 }
-
 file_security_menu(){
   clear
   box "File Security"
@@ -753,58 +824,50 @@ while true; do
   main_menu
   read -r CAT
   case "${CAT:-}" in
-    1)  # Status (direct)
-        status_check
-        read -rp $'\n[enter] ' _
-        ;;
-    2)  # Platform Tools
-        while true; do
-          platform_tools_menu
-          read -r PT
-          case "${PT:-}" in
-            1)  # Check status
-                status_check
-                read -rp $'\n[enter] ' _
-                ;;
-            2)  # Container Security submenu
-                while true; do
-                  container_security_menu
-                  read -r CSCH
-                  case "${CSCH:-}" in
-                    1) install_cs;    read -rp $'\n[enter] ' _ ;;
-                    2) remove_cs;     read -rp $'\n[enter] ' _ ;;
-                    3) deploy_malicious; deploy_normal; read -rp $'\n[enter] ' _ ;;
-                    4) remove_labs;   read -rp $'\n[enter] ' _ ;;
-                    b|B) break ;;
-                    *) echo "${WARN} Invalid option" ;;
-                  esac
-                done
-                ;;
-            3)  # File Security submenu
-                while true; do
-                  file_security_menu
-                  read -r FSCH
-                  case "${FSCH:-}" in
-                    1) install_fs;      read -rp $'\n[enter] ' _ ;;
-                    2) remove_fs;       read -rp $'\n[enter] ' _ ;;
-                    3) icap_pf_start;   read -rp $'\n[enter] ' _ ;;
-                    4) icap_pf_stop;    read -rp $'\n[enter] ' _ ;;
-                    5) icap_pf_status;  read -rp $'\n[enter] ' _ ;;
-                    b|B) break ;;
-                    *) echo "${WARN} Invalid option" ;;
-                  esac
-                done
-                ;;
-            4)  # Show URLs
-                status_urls
-                read -rp $'\n[enter] ' _
-                ;;
-            b|B) break ;;
-            *) echo "${WARN} Invalid option" ;;
-          esac
-        done
-        ;;
+    1) status_check; read -rp $'\n[enter] ' _ ;;
+    2)
+      while true; do
+        platform_tools_menu
+        read -r PT
+        case "${PT:-}" in
+          1) status_check; read -rp $'\n[enter] ' _ ;;
+          2)
+            while true; do
+              container_security_menu
+              read -r CSCH
+              case "${CSCH:-}" in
+                1) install_cs;    read -rp $'\n[enter] ' _ ;;
+                2) remove_cs;     read -rp $'\n[enter] ' _ ;;
+                3) deploy_malicious; deploy_normal; read -rp $'\n[enter] ' _ ;;
+                4) remove_labs;   read -rp $'\n[enter] ' _ ;;
+                b|B) break ;;
+                *) echo "${WARN} Invalid option" ;;
+              esac
+            done
+            ;;
+          3)
+            while true; do
+              file_security_menu
+              read -r FSCH
+              case "${FSCH:-}" in
+                1) install_fs;      read -rp $'\n[enter] ' _ ;;
+                2) remove_fs;       read -rp $'\n[enter] ' _ ;;
+                3) icap_pf_start;   read -rp $'\n[enter] ' _ ;;
+                4) icap_pf_stop;    read -rp $'\n[enter] ' _ ;;
+                5) icap_pf_status;  read -rp $'\n[enter] ' _ ;;
+                b|B) break ;;
+                *) echo "${WARN} Invalid option" ;;
+              esac
+            done
+            ;;
+          4) status_urls; read -rp $'\n[enter] ' _ ;;
+          5) cleanup_wizard; read -rp $'\n[enter] ' _ ;;   # NEW
+          b|B) break ;;
+          *) echo "${WARN} Invalid option" ;;
+        esac
+      done
+      ;;
     q|Q) exit 0 ;;
-    *)   echo "${WARN} Invalid option" ;;
+    *) echo "${WARN} Invalid option" ;;
   esac
 done
