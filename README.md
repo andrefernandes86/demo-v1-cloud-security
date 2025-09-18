@@ -32,7 +32,7 @@ It’s a **menu-driven** Bash tool — no YAML editing required.
 
 ```bash
 # From your repo
-git clone https://github.com/andrefernandes86/demo-v1-cloud-security
+git clone https://github.com/andrefernandes86/demo-v1-cloud-security.git
 cd demo-v1-cloud-security
 
 # Or download just the script from this release
