@@ -151,6 +151,11 @@ docker run -d --name v1fs-icap-server \
   andrefernandes86/demo-v1fs-icap \
   python3 app.py
 ```
+or
+
+```
+kubectl apply -f v1fs-icap-server.yaml
+```
 
 Open: `http://<docker-host>:8080/`
 
